@@ -3,7 +3,7 @@
 PSP multi-disc ISO/CSO switcher for PS Vita Adrenaline / pspemu using the
 INFERNO/UMD9660 ISO driver path.
 
-Important: Adrenaline Bubble Manager bubbles do not properly use the INFERNO driver (tested with CSO games). To use this disc swapper, you need to launch the game in the PSP XMB using Adrenaline.  
+Important: Adrenaline Bubble Manager bubbles do not properly use the INFERNO driver (tested with CSO games). To use this disc swapper, you need to launch the game in the PSP XMB using Adrenaline or patch your bubbles with [my ABM fork](https://github.com/shoui520/AdrenalineBubbleManager/releases).
 ## Install
 
 Download the latest [release](https://github.com/shoui520/adrenaline_disc_swap/releases) (.prx)  
