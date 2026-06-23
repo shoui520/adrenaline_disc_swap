@@ -14,7 +14,7 @@ Edit the file (create it if it does not exist) `ux0:/pspemu/seplugins/game.txt`,
 ms0:/seplugins/adrenaline_disc_swap.prx 1
 ```
 
-Tip: You may want [mschange](https://github.com/YuriSizuku/psp-MSChange) to emulate removing the Memory Stick, as some multi-disc games also require you to do this which is not possible on the Vita.  
+Tip: You may want [mschange](https://github.com/YuriSizuku/psp-MSChange) to emulate removing the Memory Stick, as some multi-disc games also require you to do this (such as Rewrite for PSP) which is not possible on the Vita. But only use this when you really need it, because using both mschange and adrenaline_disc_swap can cause a "turbo mode" issue with button inputs. 
 
 ## Dependencies
 
