@@ -11,6 +11,7 @@
 #include <pspctrl.h>
 #include <pspdisplay.h>
 #include <pspiofilemgr.h>
+#include <pspthreadman.h>
 #include <pspumd.h>
 #include <systemctrl.h>
 #include <systemctrl_se.h>
@@ -31,15 +32,14 @@ PSP_MODULE_INFO("ADRENALINE_DISC_SWAP", PSP_MODULE_KERNEL, 1, 0);
 #define MAX_KEY_LEN 256
 #define VISIBLE_ROWS 12
 
-#define PSP_UMD_NOT_PRESENT 1
-#define PSP_UMD_CHANGED_ONLY 5
-#define PSP_UMD_READY_CHANGED 54
-
 #define INFERNO_ISO_PATHPTR_FROM_DRV 0xA4
 #define INFERNO_ISO_FD_FROM_DRV 0x74
 #define INFERNO_TOTAL_SECTORS_FROM_DRV 0x78
 #define INFERNO_ISO_OPENED_FROM_DRV 0x128
 #define INFERNO_IS_CSO_FROM_DRV 0x12C
+
+#define THREAD_LIST_MAX 256
+#define CSO_PRIME_LBA 0x1000
 
 #ifdef DISC_CHANGE_DIAG
 #define DIAG_LOG_PATH "ms0:/seplugins/discchg_menu_diag.txt"
@@ -73,7 +73,111 @@ static char g_current_dir[MAX_PATH_LEN];
 static char g_current_name[MAX_NAME_LEN];
 static char g_status[96];
 
+static SceUID g_base_threads[THREAD_LIST_MAX];
+static int g_base_thread_count;
+static SceUID g_paused_threads[THREAD_LIST_MAX];
+static int g_paused_thread_count;
+
+static unsigned char g_sector_buf[2048] __attribute__((aligned(64)));
+
 static int is_kernel_ptr(const void *p);
+static void run_menu(void);
+
+struct LbaParams {
+    int unknown1;
+    int cmd;
+    int lba_top;
+    int lba_size;
+    int byte_size_total;
+    int byte_size_centre;
+    int byte_size_start;
+    int byte_size_last;
+};
+
+static int id_in_list(SceUID id, const SceUID *list, int count)
+{
+    int i;
+
+    for (i = 0; i < count; i++) {
+        if (list[i] == id)
+            return 1;
+    }
+
+    return 0;
+}
+
+static void capture_base_threads(void)
+{
+    g_base_thread_count = 0;
+    sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, g_base_threads,
+                                THREAD_LIST_MAX, &g_base_thread_count);
+}
+
+static void pause_game_threads(void)
+{
+    SceUID threads[THREAD_LIST_MAX];
+    int count = 0;
+    SceUID current = sceKernelGetThreadId();
+    int i;
+
+    if (g_paused_thread_count > 0)
+        return;
+
+    sceKernelGetThreadmanIdList(SCE_KERNEL_TMID_Thread, threads, THREAD_LIST_MAX, &count);
+
+    for (i = 0; i < count && g_paused_thread_count < THREAD_LIST_MAX; i++) {
+        SceUID thid = threads[i];
+
+        if (thid == current)
+            continue;
+        if (id_in_list(thid, g_base_threads, g_base_thread_count))
+            continue;
+
+        if (sceKernelSuspendThread(thid) >= 0)
+            g_paused_threads[g_paused_thread_count++] = thid;
+    }
+}
+
+static void resume_game_threads(void)
+{
+    int i;
+
+    for (i = g_paused_thread_count - 1; i >= 0; i--)
+        sceKernelResumeThread(g_paused_threads[i]);
+
+    g_paused_thread_count = 0;
+}
+
+static int raw_read_lba(const char *dev, int lba)
+{
+    struct LbaParams param;
+
+    memset(&param, 0, sizeof(param));
+    param.lba_top = lba;
+    param.lba_size = 1;
+    param.byte_size_total = sizeof(g_sector_buf);
+
+    return sceIoDevctl(dev, 0x01E380C0, &param, sizeof(param),
+                       g_sector_buf, sizeof(g_sector_buf));
+}
+
+static int prime_inferno_cso_reader(void)
+{
+    int ret_far;
+    int ret_zero;
+
+    memset(g_sector_buf, 0, sizeof(g_sector_buf));
+
+    ret_far = raw_read_lba("umd:", CSO_PRIME_LBA);
+    if (ret_far < 0)
+        ret_far = raw_read_lba("UMD:", CSO_PRIME_LBA);
+
+    ret_zero = raw_read_lba("umd:", 0);
+    if (ret_zero < 0)
+        ret_zero = raw_read_lba("UMD:", 0);
+
+    return ret_zero < 0 ? ret_zero : ret_far;
+}
 
 #ifdef DISC_CHANGE_DIAG
 static int diag_strlen(const char *s)
@@ -228,65 +332,70 @@ static void diag_live_inferno(PspIoDrv *drv, const char *stage)
 #endif
 
 #ifdef DISC_CHANGE_REMOUNT
-static int refresh_disc0_mount(void)
+static int unmount_disc0(void)
 {
 #ifdef DISC_CHANGE_REMOUNT_DIRECT
-    int value = 1;
     int ret_unassign;
-    int ret_assign;
 
 #ifdef DISC_CHANGE_DIAG
-    diag_raw("direct_remount_begin\n");
+    diag_raw("direct_unmount_begin\n");
 #endif
 
     ret_unassign = sceIoUnassign("disc0:");
 #ifdef DISC_CHANGE_DIAG
     diag_hex("direct_unassign_ret", (unsigned int)ret_unassign);
+    diag_raw("direct_unmount_end\n");
 #endif
 
-    sceKernelDelayThread(50000);
-
-    ret_assign = sceIoAssign("disc0:", "umd0:", "isofs0:", IOASSIGN_RDONLY, &value, sizeof(value));
-#ifdef DISC_CHANGE_DIAG
-    diag_hex("direct_assign_ret", (unsigned int)ret_assign);
-    diag_raw("direct_remount_end\n");
-#endif
-
-    if (ret_assign < 0)
-        return ret_assign;
-
-    if (ret_unassign < 0)
-        return ret_unassign;
-
-    return 0;
+    return ret_unassign;
 #else
     int ret_deactivate;
-    int ret_activate;
 
 #ifdef DISC_CHANGE_DIAG
-    diag_raw("remount_begin\n");
+    diag_raw("unmount_begin\n");
 #endif
 
     ret_deactivate = sceUmdDeactivate(1, "disc0:");
 #ifdef DISC_CHANGE_DIAG
-    diag_hex("remount_deactivate_ret", (unsigned int)ret_deactivate);
+    diag_hex("unmount_deactivate_ret", (unsigned int)ret_deactivate);
+    diag_raw("unmount_end\n");
 #endif
 
-    sceKernelDelayThread(50000);
+    return ret_deactivate;
+#endif
+}
+
+static int mount_disc0(void)
+{
+#ifdef DISC_CHANGE_REMOUNT_DIRECT
+    int value = 1;
+    int ret_assign;
+
+#ifdef DISC_CHANGE_DIAG
+    diag_raw("direct_mount_begin\n");
+#endif
+
+    ret_assign = sceIoAssign("disc0:", "umd0:", "isofs0:", IOASSIGN_RDONLY, &value, sizeof(value));
+#ifdef DISC_CHANGE_DIAG
+    diag_hex("direct_assign_ret", (unsigned int)ret_assign);
+    diag_raw("direct_mount_end\n");
+#endif
+
+    return ret_assign;
+#else
+    int ret_activate;
+
+#ifdef DISC_CHANGE_DIAG
+    diag_raw("mount_begin\n");
+#endif
 
     ret_activate = sceUmdActivate(1, "disc0:");
 #ifdef DISC_CHANGE_DIAG
-    diag_hex("remount_activate_ret", (unsigned int)ret_activate);
-    diag_raw("remount_end\n");
+    diag_hex("mount_activate_ret", (unsigned int)ret_activate);
+    diag_raw("mount_end\n");
 #endif
 
-    if (ret_activate < 0)
-        return ret_activate;
-
-    if (ret_deactivate < 0)
-        return ret_deactivate;
-
-    return 0;
+    return ret_activate;
 #endif
 }
 #endif
@@ -776,10 +885,22 @@ static int inferno_reopen_path(const char *path)
     if (reopen == 0)
         return 0x80010001;
 
-    sceUmdSetDriveStatus(PSP_UMD_NOT_PRESENT);
+#ifdef DISC_CHANGE_REMOUNT
+    ret = unmount_disc0();
+#ifdef DISC_CHANGE_DIAG
+    diag_hex("unmount_disc0_ret", (unsigned int)ret);
+#endif
+    if (ret < 0)
+        return ret;
+    sceKernelDelayThread(100000);
+#endif
+
+    sceUmdSetDriveStatus(PSP_UMD_NOT_PRESENT | PSP_UMD_CHANGED);
 #ifdef DISC_CHANGE_DIAG
     diag_raw("after_status_not_present\n");
 #endif
+    sceKernelDelayThread(100000);
+
     SetUmdFile((char *)path);
 #ifdef DISC_CHANGE_DIAG
     diag_raw("after_setumd\n");
@@ -797,7 +918,6 @@ static int inferno_reopen_path(const char *path)
 #endif
     }
 
-    sceUmdSetDriveStatus(PSP_UMD_CHANGED_ONLY);
 #ifdef DISC_CHANGE_DIAG
     diag_raw("before_reopen_call\n");
 #endif
@@ -811,18 +931,22 @@ static int inferno_reopen_path(const char *path)
     diag_disc0_umd_data("disc0_after_reopen");
 #endif
 #endif
-    sceUmdSetDriveStatus(PSP_UMD_CHANGED_ONLY);
-    sceKernelDelayThread(100000);
+    if (ret < 0)
+        return ret;
+
+    prime_inferno_cso_reader();
+    sceUmdSetDriveStatus(PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_CHANGED);
 #ifdef DISC_CHANGE_REMOUNT
-    ret = refresh_disc0_mount();
+    sceKernelDelayThread(100000);
+    ret = mount_disc0();
 #ifdef DISC_CHANGE_DIAG
-    diag_hex("refresh_disc0_ret", (unsigned int)ret);
+    diag_hex("mount_disc0_ret", (unsigned int)ret);
 #endif
     if (ret < 0)
         return ret;
-    sceKernelDelayThread(100000);
 #endif
-    sceUmdSetDriveStatus(PSP_UMD_READY_CHANGED);
+    sceKernelDelayThread(100000);
+    sceUmdSetDriveStatus(PSP_UMD_PRESENT | PSP_UMD_INITED | PSP_UMD_READY | PSP_UMD_CHANGED);
 #ifdef DISC_CHANGE_DIAG
 #ifdef DISC_CHANGE_DIAG_DISC0
     diag_disc0_umd_data("disc0_after_ready");
@@ -836,8 +960,13 @@ static int inferno_reopen_path(const char *path)
 static int buttons_are_up(void)
 {
     SceCtrlData pad;
+    int ret;
+
     memset(&pad, 0, sizeof(pad));
-    sceCtrlPeekBufferPositive(&pad, 1);
+    ret = sceCtrlPeekBufferPositive(&pad, 1);
+    if (ret < 0)
+        return 1;
+
     return (pad.Buttons & MENU_KEYS) == 0;
 }
 
@@ -866,8 +995,9 @@ static void run_menu(void)
     unsigned int old_buttons = 0;
     int done = 0;
 
-    scan_disc_entries();
+    pause_game_threads();
     wait_buttons_up();
+    scan_disc_entries();
 
     memset(&pad, 0, sizeof(pad));
 
@@ -875,7 +1005,9 @@ static void run_menu(void)
         unsigned int pressed;
 
         sceDisplayWaitVblankStart();
-        sceCtrlPeekBufferPositive(&pad, 1);
+        if (sceCtrlPeekBufferPositive(&pad, 1) < 0)
+            memset(&pad, 0, sizeof(pad));
+
         pressed = pad.Buttons & ~old_buttons;
         old_buttons = pad.Buttons;
 
@@ -912,7 +1044,9 @@ static void run_menu(void)
             } else {
                 copy_string(g_status, "Changing disc...", sizeof(g_status));
                 draw_menu();
+                resume_game_threads();
                 ret = inferno_reopen_path(entry->path);
+                pause_game_threads();
                 if (ret == 0) {
                     copy_string(g_current_path, entry->path, sizeof(g_current_path));
                     copy_string(g_current_name, entry->name, sizeof(g_current_name));
@@ -930,6 +1064,7 @@ static void run_menu(void)
     }
 
     wait_buttons_up();
+    resume_game_threads();
 }
 
 static int menu_thread(SceSize args, void *argp)
@@ -943,7 +1078,8 @@ static int menu_thread(SceSize args, void *argp)
     memset(&pad, 0, sizeof(pad));
 
     while (!g_stop) {
-        sceCtrlPeekBufferPositive(&pad, 1);
+        if (sceCtrlPeekBufferPositive(&pad, 1) < 0)
+            memset(&pad, 0, sizeof(pad));
 
         if ((pad.Buttons & HOTKEY) == HOTKEY) {
             if (!hotkey_down) {
@@ -968,6 +1104,9 @@ int module_start(SceSize args, void *argp)
     (void)argp;
 
     g_stop = 0;
+    g_paused_thread_count = 0;
+    capture_base_threads();
+
     thid = sceKernelCreateThread("adrenaline_disc_swap", menu_thread, 32, 0x4000, 0, NULL);
     if (thid >= 0)
         sceKernelStartThread(thid, 0, NULL);
@@ -978,5 +1117,6 @@ int module_start(SceSize args, void *argp)
 int module_stop(void)
 {
     g_stop = 1;
+    resume_game_threads();
     return 0;
 }
